@@ -447,7 +447,6 @@ module ParseResource
     end
 
     def add_error_instance(e)
-      self.error_instances
       @error_instances << e
     end
 
