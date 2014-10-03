@@ -10,9 +10,10 @@ require "parse_resource/query_methods"
 require "parse_resource/parse_error"
 require "parse_resource/parse_exceptions"
 require "parse_resource/types/parse_geopoint"
+require "parse_resource/relation_array"
 
 module ParseResource
-  
+
 
   class Base
     # ParseResource::Base provides an easy way to use Ruby to interace with a Parse.com backend
@@ -21,7 +22,11 @@ module ParseResource
     #    fields :title, :author, :body
     #  end
 
+    @@has_many_relations = []
+    @@belongs_to_relations = []
+
     include ActiveModel::Validations
+    include ActiveModel::Validations::Callbacks
     include ActiveModel::Conversion
     include ActiveModel::AttributeMethods
     extend ActiveModel::Naming
@@ -31,7 +36,7 @@ module ParseResource
     attr_accessor :error_instances
 
     define_model_callbacks :save, :create, :update, :destroy
-    
+
     # Instantiates a ParseResource::Base object
     #
     # @params [Hash], [Boolean] a `Hash` of attributes and a `Boolean` that should be false only if the object already exists
@@ -45,9 +50,9 @@ module ParseResource
       else
         @unsaved_attributes = {}
       end
-      self.attributes = {}
+      @attributes = {}
       self.error_instances = []
-            
+
       self.attributes.merge!(attributes)
       self.attributes unless self.attributes.empty?
       create_setters_and_getters!
@@ -68,7 +73,7 @@ module ParseResource
         class_eval do
           define_method("#{fname}=") do |val|
             set_attribute("#{fname}", val)
-            
+
             val
           end
         end
@@ -81,23 +86,34 @@ module ParseResource
     def self.fields(*args)
       args.each {|f| field(f)}
     end
-    
+
     # Similar to its ActiveRecord counterpart.
     #
     # @param [Hash] options Added so that you can specify :class_name => '...'. It does nothing at all, but helps you write self-documenting code.
     def self.belongs_to(parent, options = {})
       field(parent)
+      @@belongs_to_relations << parent
     end
-    
+
+    # Creates setter and getter in order access the specified relation for this Model
+    #
+    # @param [Hash] options Added so that you can specify :class_name => '...'. It does nothing at all, but helps you write self-documenting code.
+    def self.has_many(parent, options = {})
+      field(parent)
+      @@has_many_relations << parent
+    end
+
     def to_pointer
-      klass_name = self.class.model_name
+      klass_name = self.class.model_name.to_s
       klass_name = "_User" if klass_name == "User"
+      klass_name = "_Installation" if klass_name == "Installation"
+      klass_name = "_Role" if klass_name == "Role"
       {"__type" => "Pointer", "className" => klass_name.to_s, "objectId" => self.id}
     end
 
     def self.to_date_object(date)
       date = date.to_time if date.respond_to?(:to_time)
-      {"__type" => "Date", "iso" => date.iso8601} if date && (date.is_a?(Date) || date.is_a?(DateTime) || date.is_a?(Time))
+      {"__type" => "Date", "iso" => date.getutc.iso8601} if date && (date.is_a?(Date) || date.is_a?(DateTime) || date.is_a?(Time))
     end
 
     # Creates setter methods for model fields
@@ -105,7 +121,7 @@ module ParseResource
       unless self.respond_to? "#{k}="
         self.class.send(:define_method, "#{k}=") do |val|
           set_attribute("#{k}", val)
-          
+
           val
         end
       end
@@ -166,13 +182,17 @@ module ParseResource
     def self.settings
       load_settings
     end
-    
+
     # Gets the current class's model name for the URI
     def self.model_name_uri
-      if self.model_name == "User"
+      if self.model_name.to_s == "User"
         "users"
+      elsif self.model_name.to_s == "Installation"
+        "installations"
+      elsif self.model_name.to_s == "Role"
+        "roles"
       else
-        "classes/#{self.model_name}"
+        "classes/#{self.model_name.to_s}"
       end
     end
     
@@ -187,6 +207,17 @@ module ParseResource
     end
     
 
+    # Gets the current class's Parse.com base_uri
+    def self.model_base_uri
+      "https://api.parse.com/1/#{model_name_uri}"
+    end
+
+    # Gets the current instance's parent class's Parse.com base_uri
+    def model_base_uri
+      self.class.send(:model_base_uri)
+    end
+
+
     # Creates a RESTful resource
     # sends requests to [base_uri]/[classname]
     #
@@ -198,27 +229,27 @@ module ParseResource
       master_key = @@settings['master_key']
       RestClient::Resource.new(self.model_base_uri, app_id, master_key)
     end
-    
+
     # Batch requests
     # Sends multiple requests to /batch
-    # Set slice_size to send larger batches. Defaults to 20 to prevent timeouts. 
+    # Set slice_size to send larger batches. Defaults to 20 to prevent timeouts.
     # Parse doesn't support batches of over 20.
     #
     def self.batch_save(save_objects, slice_size = 20, method = nil)
       return true if save_objects.blank?
       load_settings
-      
+
       base_uri = "https://api.parse.com/1/batch"
       app_id     = @@settings['app_id']
       master_key = @@settings['master_key']
-      
+
       res = RestClient::Resource.new(base_uri, app_id, master_key)
-        
+
       # Batch saves seem to fail if they're too big. We'll slice it up into multiple posts if they are.
       save_objects.each_slice(slice_size) do |objects|
         # attributes_for_saving
         batch_json = { "requests" => [] }
-        
+
         objects.each do |item|
           method ||= (item.new?) ? "POST" : "PUT"
           object_path = "/1/#{item.class.model_name_uri}"
@@ -233,7 +264,6 @@ module ParseResource
         res.post(batch_json.to_json, :content_type => "application/json") do |resp, req, res, &block|
           response = JSON.parse(resp) rescue nil
           if resp.code == 400
-            puts resp
             return false
           end
           if response && response.is_a?(Array) && response.length == objects.length
@@ -243,7 +273,7 @@ module ParseResource
       end
       true
     end
-    
+
     def self.merge_all_attributes(objects, response)
       i = 0
       objects.each do |item|
@@ -252,28 +282,44 @@ module ParseResource
       end
       nil
     end
-    
+
     def self.save_all(objects)
       batch_save(objects)
     end
 
-    def self.destroy_all(objects)
+    def self.destroy_all(objects=nil)
+      objects ||= self.all
       batch_save(objects, 20, "DELETE")
     end
 
     def self.delete_all(o)
       raise StandardError.new("Parse Resource: delete_all doesn't exist. Did you mean destroy_all?")
     end
-    
+
     def self.load_settings
       @@settings ||= begin
         path = "config/parse_resource.yml"
         environment = defined?(Rails) && Rails.respond_to?(:env) ? Rails.env : ENV["RACK_ENV"]
-        YAML.load(ERB.new(File.new(path).read).result)[environment]
+        if FileTest.exist? (path) 
+          YAML.load(ERB.new(File.new(path).read).result)[environment]
+        elsif ENV["PARSE_RESOURCE_APPLICATION_ID"] && ENV["PARSE_RESOURCE_MASTER_KEY"]
+          settings = HashWithIndifferentAccess.new
+          settings['app_id'] = ENV["PARSE_RESOURCE_APPLICATION_ID"]
+          settings['master_key'] = ENV["PARSE_RESOURCE_MASTER_KEY"]
+          settings
+        else
+          raise "Cannot load parse_resource.yml and API keys are not set in environment"
+        end
       end
       @@settings
     end
-    
+
+
+    # Creates a RESTful resource for file uploads
+    # sends requests to [base_uri]/files
+    #
+    def self.upload(file_instance, filename, options={})
+      load_settings
 
     # Creates a RESTful resource for file uploads
     # sends requests to [base_uri]/files
@@ -282,7 +328,7 @@ module ParseResource
       load_settings
       
       base_uri = "https://api.parse.com/1/files"
-      
+
       #refactor to settings['app_id'] etc
       app_id     = @@settings['app_id']
       master_key = @@settings['master_key']
@@ -305,8 +351,10 @@ module ParseResource
     # @param [String] id the ID of the Parse object you want to find.
     # @return [ParseResource] an object that subclasses ParseResource.
     def self.find(id)
-			raise RecordNotFound if id.blank?
-      where(:objectId => id).first
+      raise RecordNotFound, "Couldn't find #{name} without an ID" if id.blank?
+      record = where(:objectId => id).first
+      raise RecordNotFound, "Couldn't find #{name} with id: #{id}" if record.blank?
+      record
     end
 
     # Find a ParseResource::Base object by chaining #where method calls.
@@ -314,7 +362,7 @@ module ParseResource
     def self.where(*args)
       Query.new(self).where(*args)
     end
-    
+
 
     include ParseResource::QueryMethods
 
@@ -331,7 +379,7 @@ module ParseResource
       attributes = HashWithIndifferentAccess.new(attributes)
       obj = new(attributes)
       obj.save
-      obj # This won't return true/false it will return object or nil...
+      obj
     end
 
     # Replaced with a batch destroy_all method.
@@ -386,7 +434,7 @@ module ParseResource
       if valid?
         run_callbacks :save do
           if new?
-            return create 
+            return create
           else
             return update
           end
@@ -394,7 +442,16 @@ module ParseResource
       else
         false
       end
-      rescue false
+    rescue
+      false
+    end
+
+    def create
+      attrs = attributes_for_saving.to_json
+      opts = {:content_type => "application/json"}
+      result = self.resource.post(attrs, opts) do |resp, req, res, &block|
+        return post_result(resp, req, res, &block)
+      end
     end
 
     def create
@@ -406,50 +463,126 @@ module ParseResource
     end
 
     def update(attributes = {})
-      
+
       attributes = HashWithIndifferentAccess.new(attributes)
-        
+
       @unsaved_attributes.merge!(attributes)
       put_attrs = attributes_for_saving.to_json
-      
+
       opts = {:content_type => "application/json"}
       result = self.instance_resource.put(put_attrs, opts) do |resp, req, res, &block|
         return post_result(resp, req, res, &block)
       end
     end
-    
+
     # Merges in the return value of a save and resets the unsaved_attributes
     def merge_attributes(results)
       @attributes.merge!(results)
       @attributes.merge!(@unsaved_attributes)
+      
+      merge_relations
       @unsaved_attributes = {}
+
+      
       create_setters_and_getters!
       @attributes
     end
-    
+
+    def merge_relations
+      # KK 11-17-2012 The response after creation does not return full description of
+      # the object nor the relations it contains. Make another request here.
+      if @@has_many_relations.map { |relation| relation.to_s.to_sym }
+        #todo: make this a little smarter by checking if there are any Pointer objects in the objects attributes.
+        @attributes = self.class.to_s.constantize.where(:objectId => @attributes["objectId"]).first.attributes
+      end
+    end
+
     def post_result(resp, req, res, &block)
       if resp.code.to_s == "200" || resp.code.to_s == "201"
+        puts "request: #{req.inspect}"
         merge_attributes(JSON.parse(resp))
+
         return true
       else
         error_response = JSON.parse(resp)
         if error_response["error"]
-          pe = ParseError.new(error_response["code"], error_response["error"]).to_array
+          pe = ParseError.new(error_response["code"], error_response["error"])
         else
-          pe = ParseError.new(resp.code.to_s).to_array
+          pe = ParseError.new(resp.code.to_s)
         end
-        self.errors.add(pe[0], pe[1])
-        self.error_instances << pe     
+        self.errors.add(pe.code.to_s.to_sym, pe.msg)
+        self.error_instances << pe
         return false
-      end      
+      end
     end
-    
+
     def attributes_for_saving
       @unsaved_attributes = pointerize(@unsaved_attributes)
       put_attrs = @unsaved_attributes
+
+      put_attrs = relations_for_saving(put_attrs)
+
       put_attrs.delete('objectId')
       put_attrs.delete('createdAt')
       put_attrs.delete('updatedAt')
+      put_attrs
+    end
+
+    def relations_for_saving(put_attrs)
+      all_add_item_queries = {}
+      all_remove_item_queries = {}
+      @unsaved_attributes.each_pair do |key, value|
+        next if !value.is_a? Array
+
+        # Go through the array in unsaved and check if they are in array in attributes (saved stuff)
+        add_item_ops = []
+        @unsaved_attributes[key].each do |item|
+          found_item_in_saved = false
+          @attributes[key].each do |item_in_saved|
+            if !!(defined? item.attributes) && item.attributes["objectId"] == item_in_saved.attributes["objectId"]
+              found_item_in_saved = true
+            end
+          end
+
+          if !found_item_in_saved && !!(defined? item.objectId)
+            # need to send additem operation to parse
+            put_attrs.delete(key) # arrays should not be sent along with REST to parse api
+            add_item_ops << {"__type" => "Pointer", "className" => item.class.to_s, "objectId" => item.objectId}
+          end
+        end
+        all_add_item_queries.merge!({key => {"__op" => "Add", "objects" => add_item_ops}}) if !add_item_ops.empty?
+
+        # Go through saved and if it isn't in unsaved perform a removeitem operation
+        remove_item_ops = []
+        unless @unsaved_attributes.empty?
+          @attributes[key].each do |item|
+            found_item_in_unsaved = false
+            @unsaved_attributes[key].each do |item_in_unsaved|
+              if !!(defined? item.attributes) && item.attributes["objectId"] == item_in_unsaved.attributes["objectId"]
+                found_item_in_unsaved = true
+              end
+            end
+
+            if !found_item_in_unsaved  && !!(defined? item.objectId)
+              # need to send removeitem operation to parse
+              remove_item_ops << {"__type" => "Pointer", "className" => item.class.to_s, "objectId" => item.objectId}
+            end
+          end
+        end
+        all_remove_item_queries.merge!({key => {"__op" => "Remove", "objects" => remove_item_ops}}) if !remove_item_ops.empty?
+      end
+
+      # TODO figure out a more elegant way to get this working. the remove_item merge overwrites the add.
+      # Use a seperate query to add objects to the relation.
+      #if !all_add_item_queries.empty?
+      #  #result = self.instance_resource.put(all_add_item_queries.to_json, {:content_type => "application/json"}) do |resp, req, res, &block|
+      #  #  return puts(resp, req, res, false, &block)
+      #  #end
+      #  puts result
+      #end
+
+      put_attrs.merge!(all_add_item_queries) unless all_add_item_queries.empty?
+      put_attrs.merge!(all_remove_item_queries) unless all_remove_item_queries.empty?
       put_attrs
     end
 
@@ -468,11 +601,11 @@ module ParseResource
 
     def reload
       return false if new?
-      
+
       fresh_object = self.class.find(id)
       @attributes.update(fresh_object.instance_variable_get('@attributes'))
       @unsaved_attributes = {}
-      
+
       self
     end
     
@@ -486,15 +619,26 @@ module ParseResource
       !dirty?
     end
 
+    def dirty?
+      @unsaved_attributes.length > 0
+    end
+
+    def clean?
+      !dirty?
+    end
+
     # provides access to @attributes for getting and setting
     def attributes
       @attributes ||= self.class.class_attributes
       @attributes
     end
 
-    # AKN 2012-06-18: Shouldn't this also be setting @unsaved_attributes?
-    def attributes=(n)
-      @attributes = n
+    def attributes=(value)
+      if value.is_a?(Hash) && value.present?
+        value.each do |k, v|
+          send "#{k}=", v
+        end
+      end
       @attributes
     end
 
@@ -506,19 +650,34 @@ module ParseResource
         klass_name = "User" if klass_name == "_User"
         case attrs[k]["__type"]
         when "Pointer"
-          result = klass_name.constantize.find(attrs[k]["objectId"])
+          result = klass_name.to_s.constantize.find(attrs[k]["objectId"])
         when "Object"
-          result = klass_name.constantize.new(attrs[k], false)
+          result = klass_name.to_s.constantize.new(attrs[k], false)
         when "Date"
-          result = DateTime.parse(attrs[k]["iso"]).to_time_in_current_zone
+          result = DateTime.parse(attrs[k]["iso"]).in_time_zone
         when "File"
           result = attrs[k]["url"]
         when "GeoPoint"
           result = ParseGeoPoint.new(attrs[k])
+        when "Relation"
+          objects_related_to_self = klass_name.constantize.where("$relatedTo" => {"object" => {"__type" => "Pointer", "className" => self.class.to_s, "objectId" => self.objectId}, "key" => k}).all
+          attrs[k] = RelationArray.new self, objects_related_to_self, k, klass_name
+          @unsaved_attributes[k] = RelationArray.new self, objects_related_to_self, k, klass_name
+          result = @unsaved_attributes[k]
         end #todo: support other types https://www.parse.com/docs/rest#objects-types
       else
-        result =  attrs["#{k}"]
-      end          
+        #relation will assign itself if an array, this will add to unsave_attributes
+         if @@has_many_relations.index(k.to_s.to_sym)
+          if attrs[k].nil?
+            result = nil
+          else
+            @unsaved_attributes[k] = attrs[k].clone
+            result = @unsaved_attributes[k]
+          end
+        else
+          result =  attrs["#{k}"]
+        end
+      end
       result
     end
 
@@ -526,11 +685,19 @@ module ParseResource
       if v.is_a?(Date) || v.is_a?(Time) || v.is_a?(DateTime)
         v = self.class.to_date_object(v)
       elsif v.respond_to?(:to_pointer)
-        v = v.to_pointer 
+        v = v.to_pointer
       end
       @unsaved_attributes[k.to_s] = v unless v == @attributes[k.to_s] # || @unsaved_attributes[k.to_s]
       @attributes[k.to_s] = v
       v
+    end
+
+    def self.has_many_relations
+      @@has_many_relations
+    end
+
+    def self.belongs_to_relations
+      @@belongs_to_relations
     end
 
 
@@ -538,15 +705,24 @@ module ParseResource
     def id; get_attribute("objectId") rescue nil; end
     def objectId; get_attribute("objectId") rescue nil; end
 
-    def created_at; self.createdAt; end
+    def created_at; get_attribute("createdAt"); end
 
-    def updated_at; self.updatedAt rescue nil; end
+    def updated_at; get_attribute("updatedAt"); rescue nil; end
 
     def self.included(base)
       base.extend(ClassMethods)
     end
 
     module ClassMethods
+    end
+
+    #if we are comparing objects, use id if they are both ParseResource objects
+    def ==(another_object)
+      if another_object.class <= ParseResource::Base
+        self.id == another_object.id
+      else
+        super
+      end
     end
 
   end

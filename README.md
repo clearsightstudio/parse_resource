@@ -1,7 +1,11 @@
 ParseResource 
 =============
 
-[![Build Status](https://secure.travis-ci.org/adelevie/parse_resource.png)](http://travis-ci.org/adelevie/parse_resource)
+### Maintainer needed
+
+Unfortunately, I haven't been able to give this library the time it deserves. If you'd like to be a maintainer, please let me know.
+
+[![Build Status](https://secure.travis-ci.org/adelevie/parse_resource.png)](http://travis-ci.org/adelevie/parse_resource) [![Code Climate](https://codeclimate.com/github/adelevie/parse_resource.png)](https://codeclimate.com/github/adelevie/parse_resource)
 
 
 ParseResource makes it easy to interact with Parse.com's REST API. It adheres to the ActiveRecord pattern. ParseResource is fully ActiveModel compliant, meaning you can use validations and Rails forms.
@@ -29,12 +33,14 @@ Installation
 Include in your `Gemfile`:
 
 ```ruby
-gem "parse_resource", "~> 1.7.2"
+gem "kaminari" # optional for pagination support
+gem "parse_resource", "~> 1.8.0"
 ```
 
 Or just gem install:
 
 ```ruby
+gem install kaminari # optional for pagination support
 gem install parse_resource
 ```
 
@@ -52,6 +58,13 @@ test:
 production:
   app_id: 1234567890
   master_key: abcdefgh
+```
+
+If you keep `parse_resource.yml` in `.gitignore`, ParseResource will alternatively look for the api keys in environment variables. If using Heroku you can easily set your api keys in the Heroku environment using:
+
+```
+heroku config:set PARSE_RESOURCE_APPLICATION_ID=1234567890
+heroku config:set PARSE_RESOURCE_MASTER_KEY=abcdefgh
 ```
 
 You can create separate Parse databases if you want. If not, include the same info for each environment.
@@ -148,6 +161,18 @@ posts.length #=> 5
 
 # get a count
 Post.where(:bar => "foo").count #=> 1337
+
+```
+
+Pagination with [kaminari](https://github.com/amatsuda/kaminari):
+
+```ruby
+# get second page of results (default is 25 per page)
+Post.page(2).where(:foo => "bar")
+
+# get second page with 100 results per page
+Post.page(2).per(100).where(:foo => "bar")
+
 ```
 
 Users
@@ -206,6 +231,17 @@ end
 ```
 
 If you want to use parse_resource to back a simple authentication system for a Rails app, follow this [tutorial](http://asciicasts.com/episodes/250-authentication-from-scratch), and make some simple modifications.
+
+Installations
+
+Note: Because [Installations](https://parse.com/docs/rest#installations), are special in the Parse API, you must name your class Installation if you want to manipulate installation objects.
+
+```ruby
+class Installation < ParseResource::Base
+  fields :appName, :appVersion, :badge, :channels, :deviceToken, :deviceType,
+         :installationId, :parseVersion, :timeZone
+end
+```
 
 GeoPoints
 
@@ -278,6 +314,10 @@ posts.each do |post|
 	# because you used Post#include_object, calling post.title won't execute a new query
 	# this is similar to ActiveRecord's eager loading
 end
+
+# fetch users through a relation on posts named commenters
+post = Post.first
+users = User.related_to(post, :commenters)
 ```
 
 File Upload
@@ -285,7 +325,7 @@ File Upload
 ```ruby
   @post = Post.first()
   result = Post.upload(uploaded_file.tempfile, uploaded_file.original_filename, content_type: uploaded_file.content_type)
-  @post.thumbnail = {"name" => result["name"], "__type" => "File"}
+  @post.thumbnail = {"name" => result["name"], "__type" => "File", "url" => result["url"]}
 ```
 
 Custom Getters and Setters
@@ -338,6 +378,6 @@ Contributing to ParseResource
 Copyright
 ---------
 
-Copyright (c) 2012 Alan deLevie. See LICENSE.txt for
+Copyright (c) 2013 Alan deLevie. See LICENSE.txt for
 further details.
 
