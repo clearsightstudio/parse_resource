@@ -713,8 +713,8 @@ module ParseResource
       base.extend(ClassMethods)
     end
 
-    # module ClassMethods
-    # end
+    module ClassMethods
+    end
 
     #if we are comparing objects, use id if they are both ParseResource objects
     def ==(another_object)
